@@ -1,0 +1,226 @@
+apiVersion: v1
+kind: Template
+labels:
+  app: jenkins-agent-debian
+  template: jenkins-agent-debian-jenkins-pipeline
+metadata:
+  annotations:
+    description: Jenkins Agent Debian Image - Jenkinsfile
+      see https://github.com/faust64/docker-jenkins-agent-debian
+    iconClass: icon-openshift
+    openshift.io/display-name: Jenkins Agent Debian CI
+    tags: jenkins-agent-debian
+  name: jenkins-agent-debian-jenkins-pipeline
+objects:
+- apiVersion: v1
+  kind: BuildConfig
+  metadata:
+    annotations:
+      description: Builds Jenkins Agent Debian images
+    name: jenkinsagentdebian-jenkins-pipeline
+  spec:
+    strategy:
+      jenkinsPipelineStrategy:
+        jenkinsfile: |-
+          def gitCommitMsg = ''
+          def templateMark = 'jad-jenkins-ci'
+          def templateSel  = 'jenkins-ci-mark'
+          pipeline {
+              agent {
+                  node { label 'maven' }
+              }
+              options { timeout(time: 140, unit: 'MINUTES') }
+              parameters {
+                  string(defaultValue: 'master', description: 'Jenkins Agent Debian Docker Image - Source Git Branch', name: 'jenkinsagentdebianBranch')
+                  string(defaultValue: 'master', description: 'Jenkins Agent Debian Docker Image - Source Git Hash', name: 'jenkinsagentdebianHash')
+                  string(defaultValue: '${GIT_SOURCE_HOST}/CI/docker-jenkins-agent-debian.git', description: 'Jenkins Agent Debian Docker Image - Source Git Repository', name: 'jenkinsagentdebianRepo')
+                  string(defaultValue: '3', description: 'Max Retry', name: 'jobMaxRetry')
+                  string(defaultValue: '1', description: 'Retry Count', name: 'jobRetryCount')
+              }
+              stages {
+                  stage('pre-cleanup') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      echo "Using project: ${openshift.project()}"
+                                      echo "cleaning up previous assets for jad-${params.jenkinsagentdebianHash}"
+                                      openshift.selector("all", [ "${templateSel}": "${templateMark}-${params.jenkinsagentdebianHash}" ]).delete()
+                                      openshift.selector("secrets", [ "${templateSel}": "${templateMark}-${params.jenkinsagentdebianHash}" ]).delete()
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('create') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      def namespace = "${openshift.project()}"
+                                      try {
+                                          timeout(10) {
+                                              def cloneProto = "http"
+                                              def created
+                                              def objectsFromTemplate
+                                              def privateRepo = false
+                                              def repoHost = params.jenkinsagentdebianRepo.split('/')[0]
+                                              def templatePath = "/tmp/workspace/${namespace}/${namespace}-jenkinsagentdebian-jenkins-pipeline/tmpjad${params.jenkinsagentdebianBranch}/openshift"
+                                              sh "git config --global http.sslVerify false"
+                                              sh "rm -fr tmpjad${params.jenkinsagentdebianBranch}; mkdir -p tmpjad${params.jenkinsagentdebianBranch}"
+                                              dir ("tmpjad${params.jenkinsagentdebianBranch}") {
+                                                  try {
+                                                      withCredentials([string(credentialsId: "git-${repoHost}", variable: 'GIT_TOKEN')]) {
+                                                          cloneProto = "https"
+                                                          privateRepo = true
+                                                          echo "cloning ${params.jenkinsagentdebianRepo} over https, using ${repoHost} token"
+                                                          try { git([ branch: "${params.jenkinsagentdebianBranch}", url: "https://${GIT_TOKEN}@${params.jenkinsagentdebianRepo}" ]) }
+                                                          catch(e2) {
+                                                              echo "Failed cloning ${params.jenkinsagentdebianRepo}#${params.jenkinsagentdebianBranch} - ${e2}"
+                                                              throw e2
+                                                          }
+                                                      }
+                                                  } catch(e) {
+                                                      if (privateRepo != true) {
+                                                          echo "caught ${e} - assuming no credentials required"
+                                                          echo "cloning ${params.jenkinsagentdebianRepo} over http"
+                                                          try { git([ branch: "${params.jenkinsagentdebianBranch}", url: "http://${params.jenkinsagentdebianRepo}" ]) }
+                                                          catch(e2) {
+                                                              echo "Failed cloning ${params.jenkinsagentdebianRepo}#${params.jenkinsagentdebianBranch} - ${e2}"
+                                                              throw e2
+                                                          }
+                                                      } else { throw e }
+                                                  }
+                                                  try {
+                                                      gitCommitMsg = sh(returnStdout: true, script: "git log -n 1").trim()
+                                                  } catch(e) { echo "In non-critical catch block resolving commit message - ${e}" }
+                                              }
+                                              try { sh "test -d ${templatePath}" }
+                                              catch (e) {
+                                                  echo "Could not find ./openshift in ${params.jenkinsagentdebianRepo}#${params.jenkinsagentdebianBranch}"
+                                                  throw e
+                                              }
+                                              echo "Processing JenkinsAgentDebian:${params.jenkinsagentdebianHash}, from ${repoHost}, tagging to ${params.jenkinsagentdebianBranch}"
+                                              try {
+                                                  echo " == Creating ImageStream =="
+                                                  objectsFromTemplate = openshift.process("-f", "${templatePath}/imagestream.yaml")
+                                                  echo "The template will create ${objectsFromTemplate.size()} objects"
+                                                  created = openshift.apply(objectsFromTemplate)
+                                                  created.withEach { echo "Created ${it.name()} with labels ${it.object().metadata.labels}" }
+                                              } catch(e) { echo "In non-critical catch block while creating ImageStream - ${e}" }
+                                              echo " == Creating BuildConfigs =="
+                                              if (privateRepo) {
+                                                  withCredentials([string(credentialsId: "git-${repoHost}", variable: 'GIT_TOKEN')]) {
+                                                      objectsFromTemplate = openshift.process("-f", "${templatePath}/build-with-secret.yaml", '-p', "GIT_DEPLOYMENT_TOKEN=${GIT_TOKEN}",
+                                                          '-p', "JAD_REPOSITORY_REF=${params.jenkinsagentdebianHash}", '-p', "JAD_REPOSITORY_URL=${cloneProto}://${params.jenkinsagentdebianRepo}")
+                                                  }
+                                              } else {
+                                                  objectsFromTemplate = openshift.process("-f", "${templatePath}/build.yaml",
+                                                      '-p', "JAD_REPOSITORY_REF=${params.jenkinsagentdebianHash}", '-p', "JAD_REPOSITORY_URL=${cloneProto}://${params.jenkinsagentdebianRepo}")
+                                              }
+                                              echo "The template will create ${objectsFromTemplate.size()} objects"
+                                              for (o in objectsFromTemplate) { o.metadata.labels["${templateSel}"] = "${templateMark}-${params.jenkinsagentdebianHash}" }
+                                              created = openshift.apply(objectsFromTemplate)
+                                              created.withEach { echo "Created ${it.name()} from template with labels ${it.object().metadata.labels}" }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while creating resources - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('build') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      try {
+                                          timeout(100) {
+                                              echo "watching jad-${params.jenkinsagentdebianHash} docker image build"
+                                              def builds = openshift.selector("bc", [ name: "jad-${params.jenkinsagentdebianHash}" ]).related('builds')
+                                              builds.untilEach(1) { return (it.object().status.phase == "Complete") }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while building Docker image - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('tag') {
+                      steps {
+                          script {
+                              if ("${params.jenkinsagentdebianBranch}" == "${params.jenkinsagentdebianHash}") { echo "skipping tag - source matches target" }
+                              else {
+                                  openshift.withCluster() {
+                                      openshift.withProject() {
+                                          try {
+                                              timeout(5) {
+                                                  def namespace = "${openshift.project()}"
+                                                  retry(3) {
+                                                      sh """
+                                                      oc login https://kubernetes.default.svc.cluster.local --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt --token=\$(cat /var/run/secrets/kubernetes.io/serviceaccount/token) > /dev/null 2>&1
+                                                      oc describe -n ${namespace} imagestreamtag jenkins-agent-debian:${params.jenkinsagentdebianHash} || exit 1
+                                                      oc tag -n ${namespace} jenkins-agent-debian:${params.jenkinsagentdebianHash} jenkins-agent-debian:${params.jenkinsagentdebianBranch}
+                                                      """
+                                                  }
+                                              }
+                                          } catch(e) {
+                                              echo "In catch block while tagging Jenkins Agent Debian image - ${e}"
+                                              throw e
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+              post {
+                  always {
+                      script {
+                          openshift.withCluster() {
+                              openshift.withProject() {
+                                  def namespace   = "${openshift.project()}"
+                                  def postJobName = "${namespace}/${namespace}-post-triggers-jenkins-pipeline"
+                                  currentBuild.description = """
+                                  ${params.jenkinsagentdebianRepo} ${params.jenkinsagentdebianBranch} (try ${params.jobRetryCount}/${params.jobMaxRetry})
+                                  ${gitCommitMsg}
+                                  """.stripIndent()
+                                  echo "cleaning up assets for jad-${params.jenkinsagentdebianHash}"
+                                  sh "rm -fr /tmp/workspace/${namespace}/${namespace}-jenkinsagentdebian-jenkins-pipeline/tmpjad${params.jenkinsagentdebianBranch}"
+                                  openshift.selector("all", [ "${templateSel}": "${templateMark}-${params.jenkinsagentdebianHash}" ]).delete()
+                                  openshift.selector("secrets", [ "${templateSel}": "${templateMark}-${params.jenkinsagentdebianHash}" ]).delete()
+                                  def jobParams = [
+                                          [$class: 'StringParameterValue', name: "jobMaxRetry", value: params.jobMaxRetry],
+                                          [$class: 'StringParameterValue', name: "jobRetryCount", value: params.jobRetryCount],
+                                          [$class: 'StringParameterValue', name: "jobStatus", value: currentBuild.currentResult],
+                                          [$class: 'StringParameterValue', name: "sourceBranch", value: params.jenkinsagentdebianBranch],
+                                          [$class: 'StringParameterValue', name: "sourceComponent", value: "jenkinsagentdebian"],
+                                          [$class: 'StringParameterValue', name: "sourceImageStream", value: "jenkins-agent-debian"],
+                                          [$class: 'StringParameterValue', name: "sourceRef", value: params.jenkinsagentdebianHash],
+                                          [$class: 'StringParameterValue', name: "sourceRepo", value: params.jenkinsagentdebianRepo]
+                                      ]
+                                  try { build job: postJobName, parameters: jobParams, propagate: false, wait: false }
+                                  catch(e) { echo "caught ${e} starting Job post-process" }
+                              }
+                          }
+                      }
+                  }
+                  changed { echo "changed?" }
+                  failure { echo "Build failed (${params.jobRetryCount} out of ${params.jobMaxRetry})" }
+                  success { echo "success!" }
+                  unstable { echo "unstable?" }
+              }
+          }
+      type: JenkinsPipeline
+parameters:
+- name: GIT_SOURCE_HOST
+  description: Git FQDN we would build images from
+  displayName: Git
+  value: github.com
