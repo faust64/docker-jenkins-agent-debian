@@ -13,14 +13,26 @@ export JENKINS_HOME=/home/jenkins
 # Make sure the Java clients have valid $HOME directory set
 export HOME=${JENKINS_HOME}
 
+export JAVA_VERSION=${USE_JAVA_VERSION:=java-11}
+
 source /usr/local/bin/generate_container_user
 
 CONTAINER_MEMORY_IN_BYTES=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
 CONTAINER_MEMORY_IN_MB=$((CONTAINER_MEMORY_IN_BYTES/2**20))
 
+#if [[ "$(uname -m)" == "x86_64" ]]; then
+#    alternatives --set java $(alternatives --display java | grep $JAVA_VERSION | awk '/family.*x86_64/ { print $1; }')
+#    alternatives --set javac $(alternatives --display javac | grep $JAVA_VERSION | awk '/family.*x86_64/ { print $1; }')
+#else
+#    alternatives --set java $(alternatives --display java | grep $JAVA_VERSION | awk '/family.*'$(uname -m)'/ { print $1; }')
+#    alternatives --set javac $(alternatives --display javac | grep $JAVA_VERSION | awk '/family.*'$(uname -m)'/ { print $1; }')
+#fi
+
 echo "OPENSHIFT_JENKINS_JVM_ARCH='${OPENSHIFT_JENKINS_JVM_ARCH}', CONTAINER_MEMORY_IN_MB='${CONTAINER_MEMORY_IN_MB}', using $(readlink /etc/alternatives/java)"
 
-if [[ -z "${SKIP_NO_PROXY_DEFAULT}" ]]; then
+shopt -s nocasematch
+if [[ -z "${SKIP_NO_PROXY_DEFAULT}" || \
+    "${SKIP_NO_PROXY_DEFAULT}" != "false" ]]; then
   # we do not want jenkins svc or jenkins-jnlp svc
   # communication going through a http proxy
   # env vars to consider:
@@ -41,6 +53,7 @@ if [[ -z "${SKIP_NO_PROXY_DEFAULT}" ]]; then
     export NO_PROXY=$jenkins_http_host,$jnlp_http_host,$NO_PROXY
   fi
 fi
+shopt -u nocasematch
 
 # Configure the slave image
 source /usr/local/bin/configure-slave
@@ -91,10 +104,11 @@ if [[ $(echo "$@" | awk '{print NF}') -gt 1 ]]; then
     fi
   fi
 
+  #NOTE: The following default options are deprecated with java 11. We disable them for all, including java-1.8
   if [[ -z "${JAVA_TOOL_OPTIONS}" ]]; then
     # these options will automatically be picked up by any JVM process but can
     # be overridden on that process' command line.
-    JAVA_TOOL_OPTIONS="-XX:+UnlockExperimentalVMOptions -XX:+UseCGroupMemoryLimitForHeap -Dsun.zip.disableMemoryMapping=true"
+    #JAVA_TOOL_OPTIONS="-XX:+UnlockExperimentalVMOptions -XX:+UseCGroupMemoryLimitForHeap -Dsun.zip.disableMemoryMapping=true"
     export JAVA_TOOL_OPTIONS
   fi
 
@@ -156,7 +170,7 @@ if [[ $(echo "$@" | awk '{print NF}') -gt 1 ]]; then
   read -a JNLP_JAVA_OVERRIDES_ARRAY <<< "$JNLP_JAVA_OVERRIDES"
 
   set -x
-  cd ${JENKINS_DIR} && exec java $JNLP_JAVA_OPTIONS \
+  cd ${JENKINS_DIR} && exec java -Duser.home=${HOME} $JNLP_JAVA_OPTIONS \
                                  "${JNLP_JAVA_OVERRIDES_ARRAY[@]}" \
                                  -cp $JAR hudson.remoting.jnlp.Main \
                                  -headless $PARAMS "$@"
